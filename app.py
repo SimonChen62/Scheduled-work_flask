@@ -4,155 +4,169 @@ from sqlalchemy import text
 from flask_migrate import Migrate
 from flask_cors import CORS
 import os
-import hashlib
 from werkzeug.security import generate_password_hash, check_password_hash
-from apscheduler.schedulers.background import BackgroundScheduler  # 定时任务调度
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore  # 任务持久化
-from apscheduler.triggers.cron import CronTrigger # 导入 CronTrigger 用于解析和验证
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
 import subprocess
 from werkzeug.utils import secure_filename
 
+# --- 部署修改 ---
+# 1. 从环境变量获取前端URL，提供一个本地开发的默认值
+#    在Render上，你需要设置环境变量 FRONTEND_URL 为你部署后React应用的URL
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://127.0.0.1:3000')
+
+# 2. 从环境变量获取数据库URL
+#    Render会自动提供 DATABASE_URL 环境变量
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+# 3. 从环境变量获取SECRET_KEY，提供一个用于本地开发的默认值
+#    在Render上，你需要设置一个高强度的 SECRET_KEY
+SECRET_KEY = os.environ.get('SECRET_KEY', 'a-very-secret-key-for-dev')
+
 app = Flask(__name__)
-CORS(app, origins="http://127.0.0.1:3000", supports_credentials=True)
+CORS(app, origins=FRONTEND_URL, supports_credentials=True)
 
+# --- 部署修改 ---
+# 4. 配置数据库和密钥
+if DATABASE_URL:
+    # 生产环境 (Render): 使用 DATABASE_URL
+    # Render 提供的 mysql url 可能是 mysql://...，需要替换为 mysql+pymysql://
+    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
+else:
+    # 本地开发环境: 使用旧的配置
+    HOSTNAME="localhost"
+    PORT="3306"
+    USERNAME="root"
+    PASSWORD="Xajdlyld6622"
+    DATABASE="flasklearn"
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'mysql+pymysql://{USERNAME}:{PASSWORD}@{HOSTNAME}:{PORT}/{DATABASE}?charset=utf8mb4'
 
-HOSTNAME="localhost"
-PORT="3306"  
-USERNAME="root"  
-PASSWORD="Xajdlyld6622"
-DATABASE="flasklearn"  
-# 在 app.config 中添加以下配置（放在 SECRET_KEY 后面）
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # 允许跨域请求携带 Cookie
-app.config['SESSION_COOKIE_HTTPONLY'] = True   # 增强安全性（不影响传递）
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8mb4'.format(USERNAME,PASSWORD,HOSTNAME,PORT,DATABASE)
-app.config['UPLOAD_FOLDER'] = 'uploads'  # 脚本上传目录，在当前项下自动创建
-app.config['SECRET_KEY'] = 'your-secret-key'  # 用于session加密，session['user.id']记录这个id的登录状态
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)  #确保上传目录存在，即帮助创建
+app.config['SECRET_KEY'] = SECRET_KEY
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+
+# 注意：Render的免费服务文件系统是临时的，上传的文件会在服务重启或重新部署后丢失。
+# 如果需要持久化存储，建议使用Render的付费Disks功能或第三方对象存储（如AWS S3）。
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
-migrate = Migrate(app, db)  
-
+# ... 您的 User 和 Task 模型定义保持不变 ...
 class User(db.Model):
     __tablename__ = 'user'
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)  #表当中的字段，主键/像索引，自动递增
-    username = db.Column(db.String(80), unique=True, nullable=False) #不能为空，而且唯一
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
     password = db.Column(db.String(300), nullable=False)
 
 class Task(db.Model):
     __tablename__ = 'task'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)  # 关联用户
-    task_name = db.Column(db.String(100), nullable=False)  # 任务名称
-    script_path = db.Column(db.String(255), nullable=False)  # 脚本文件路径
-    cron_expr = db.Column(db.String(50), nullable=False)  # cron表达式
-    status = db.Column(db.String(20), default='stopped')  # 状态：running/stopped
-    created_at = db.Column(db.DateTime, default=datetime.now)   #不给出，会默认当前时间
-    # 关联用户（方便查询）
-    user = db.relationship('User', backref=db.backref('task', lazy=True)) #这样可以直接user.task互相访问，backref
-    #在需要关联的class中，建立另一个关联=该class的name
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    task_name = db.Column(db.String(100), nullable=False)
+    script_path = db.Column(db.String(255), nullable=False)
+    cron_expr = db.Column(db.String(50), nullable=False)
+    status = db.Column(db.String(20), default='stopped')
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    user = db.relationship('User', backref=db.backref('task', lazy=True))
 
+# --- 部署修改 ---
+# 5. 确保 scheduler 使用与 app 相同的数据库配置
 scheduler = BackgroundScheduler()
 scheduler.add_jobstore(SQLAlchemyJobStore(url=app.config['SQLALCHEMY_DATABASE_URI']), 'default')
-scheduler.start()
 
+# 在应用上下文中启动调度器，以确保数据库连接可用
+with app.app_context():
+    # 检查数据库连接
+    try:
+        db.session.execute(text('SELECT 1'))
+        if not scheduler.running:
+            scheduler.start()
+    except Exception as e:
+        print(f"数据库连接失败或调度器启动失败: {e}")
+
+
+# ... 您所有的 @app.route(...) 路由函数保持不变 ...
 @app.route('/register', methods=['POST'])
 def register():
-    data = request.get_json() # 获取请求体中的数据
+    data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-
-    # 校验：用户名和密码是否为空
     if not username or not password:
         return jsonify({"error": "the username and pasword cannot be empty"}), 400
-
-    # 密码加密
-    hashed_password = generate_password_hash(password) # 加密密码，固定
-
-    # 检查用户名是否已存在
+    hashed_password = generate_password_hash(password)
     existing_user = User.query.filter_by(username=username).first()
     if existing_user:
         return jsonify({"error": "the username already exists "}), 400
-
-    # 创建新用户
     new_user = User(username=username, password=hashed_password)
-    db.session.add(new_user)  # 添加到会话
-    db.session.commit()       # 提交到数据库
-
+    db.session.add(new_user)
+    db.session.commit()
     return jsonify({"message": "registered successfully"}), 201
-
 
 @app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-        
-    # 检查输入是否为空
     if not username or not password:
         return jsonify({'error': 'the username and pasword cannot be empty'}), 400
-        
-    user = User.query.filter_by(username=username).first() #查询用户，获得user对象
+    user = User.query.filter_by(username=username).first()
     if user and check_password_hash(user.password, password):
-        user_info = {
-            'id': user.id,
-            'username': user.username
-        }
-        session['user_id']=user.id #记录登录状态，为后续给出权限。session这个是自带属性
-        print("登录成功后 Session：", dict(session)) 
+        user_info = {'id': user.id, 'username': user.username}
+        session['user_id']=user.id
         return jsonify({'message': 'logined successfully', 'user': user_info}), 200
     else:
         return jsonify({'error': 'username or password is wrong'}), 401
 
-
-@app.route('/upload_task', methods=['POST']) #上传任务
+@app.route('/upload_task', methods=['POST'])
 def task():
-    if 'user_id' not in session: #只有在本浏览器登录后才会有这个键名，不同电脑登录互不影响。只要有这个键名就可以
+    if 'user_id' not in session:
         return jsonify({'error': 'please login first'}), 401
-    if 'script' not in request.files: #脚本不能为空，看前端是否返回这个建。查看脚本
+    if 'script' not in request.files:
         return jsonify({'error': 'the script cannot be empty'}), 400
-    file = request.files['script'] #获取上传的文件，放到file对象中
+    file = request.files['script']
     if file.filename =='':
         return jsonify({'error': 'the script cannot be empty'}), 400
-    
-    filename = secure_filename(file.filename)  #安全的文件名，防止路径穿越，预处理。对文件名预处理
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename) #关联脚本路径，方便保存
-    file.save(filepath) #保存脚本文件
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    return jsonify({"message": "上传成功", "script_path": filepath}), 200
 
-    return jsonify({"message": "上传成功", "script_path": filepath}), 200  #注意，返回了path
-
-@app.route('/create_task', methods=['POST']) #记录创建任务，把脚本路径，cron表达式这些存储到数据库
+@app.route('/create_task', methods=['POST'])
 def create_task():
-    if 'user_id' not in session: #同理，有键名就可以
+    if 'user_id' not in session:
         return jsonify({'error': 'please login first'}), 401
     data = request.get_json()
-    user_id = session['user_id'] #从session中获取用户id
-
-    #验证给出的cron表达合法性
+    user_id = session['user_id']
+    cron_expression = data.get('cron_expr')
     try:
-        # 使用 APScheduler 的 CronTrigger 进行验证
-        CronTrigger.from_crontab(data['cron_expr'])
-    except Exception as e: #如果cron表达式不合法会报错，然后exception就是捕获这个异常的代码并给e,最后打印即可
+        parts = cron_expression.split()
+        if len(parts) == 5:
+            CronTrigger.from_crontab(cron_expression)
+        elif len(parts) == 6:
+            CronTrigger(second=parts[0], minute=parts[1], hour=parts[2], day=parts[3], month=parts[4], day_of_week=parts[5])
+        else:
+            raise ValueError("cron表达式必须有5个或6个字段")
+    except Exception as e:
         return jsonify({"error": f"cron表达式无效: {str(e)}"}), 400
-    
     new_task=Task(
         user_id=user_id,
         task_name=data['task_name'],
-        script_path=data['script_path'], #查看如何前端传过来，前端？
-        cron_expr=data['cron_expr']
+        script_path=data['script_path'],
+        cron_expr=cron_expression
     )
     db.session.add(new_task)
     db.session.commit()
     return jsonify({"message": "任务创建成功", "task_id": new_task.id}), 201
 
 def run_script(script_path, task_name):
-    """在后台执行脚本的函数"""
     try:
         result = subprocess.run(
             ['python', script_path],
-            capture_output=True,
-            text=True,
-            check=True # 如果脚本执行出错，会抛出 CalledProcessError
+            capture_output=True, text=True, check=True
         )
         print(f"任务 '{task_name}' 执行成功. 输出: {result.stdout}")
     except FileNotFoundError:
@@ -162,68 +176,55 @@ def run_script(script_path, task_name):
     except Exception as e:
         print(f"执行任务 '{task_name}' 时发生未知错误: {str(e)}")
 
-@app.route('/start/<int:task_id>', methods=['POST']) #启动任务,并把任务的id传过来，尖括号可以直接获取，作为task_id传递
+@app.route('/start/<int:task_id>', methods=['POST'])
 def start_task(task_id):
     if 'user_id' not in session:
         return jsonify({"error": "please login first"}), 401
-    
-    task = Task.query.filter_by(id=task_id,user_id=session['user_id']).first() #没找到返回none，first就是帮助提取，前面的访问并根据要求查群，最后提取
-    if not task:#为空
+    task = Task.query.filter_by(id=task_id,user_id=session['user_id']).first()
+    if not task:
         return jsonify({"error": "task not found"}), 404
-    
+    trigger = None
     try:
-        # 从 cron 表达式创建触发器
-        trigger = CronTrigger.from_crontab(task.cron_expr)
+        parts = task.cron_expr.split()
+        if len(parts) == 5:
+            trigger = CronTrigger.from_crontab(task.cron_expr)
+        elif len(parts) == 6:
+            trigger = CronTrigger(second=parts[0], minute=parts[1], hour=parts[2], day=parts[3], month=parts[4], day_of_week=parts[5])
+        else:
+            raise ValueError("数据库中的cron表达式格式不正确")
     except Exception as e:
         return jsonify({"error": f"无法解析cron表达式: {str(e)}"}), 400
-
     scheduler.add_job(
-        run_script,
-        trigger, # 直接使用创建好的 trigger 对象
-        args=[task.script_path, task.task_name], # 通过 args 将脚本路径和任务名传递给 run_script 函数
-        id=str(task_id),  # 用任务ID作为唯一标识,起名字，要求必须字符串
-        replace_existing=True  # 重复添加时替换
+        run_script, trigger,
+        args=[task.script_path, task.task_name],
+        id=str(task_id), replace_existing=True
     )
     task.status = 'running'
-    db.session.commit() #更新状态
+    db.session.commit()
     return jsonify({"message": "task has started"}), 200
 
 @app.route('/stop/<int:task_id>', methods=['POST'])
 def stop_task(task_id):
     if 'user_id' not in session:
         return jsonify({"error": "please login first"}), 401
-    
     task = Task.query.filter_by(id=task_id, user_id=session['user_id']).first()
     if not task:
         return jsonify({"error": "task does not exist"}), 404
-    
-    # 增加一个判断，防止因任务不存在而移除失败报错
     if scheduler.get_job(str(task_id)):
-        scheduler.remove_job(str(task_id))#移除任务
-
-    task.status='stopped' # 修正拼写错误
+        scheduler.remove_job(str(task_id))
+    task.status='stopped'
     db.session.commit()
     return jsonify({"message": "task has stopped"}), 200
 
 @app.route('/get-task',methods=['GET'])
-def get_task(): #返回给前端任务列表
-    print("获取任务时的 Session：", dict(session)) 
+def get_task():
     if 'user_id' not in session:
         return jsonify({"error": "please login first"}), 401
-    
     tasks=Task.query.filter_by(user_id=session['user_id']).all()
     task_list = [{
-        "id": task.id,
-        "task_name": task.task_name,
-        "script_path": task.script_path,
-        "cron_expr": task.cron_expr,
-        "status": task.status,
+        "id": task.id, "task_name": task.task_name, "script_path": task.script_path,
+        "cron_expr": task.cron_expr, "status": task.status,
         "created_at": task.created_at.strftime("%Y-%m-%d %H:%M:%S")
-    } for task in tasks] #前面的输出内容和格式，后面循环遍历
+    } for task in tasks]
     return jsonify({"tasks": task_list}), 200
 
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    
-    app.run(host='127.0.0.1', port=5000, debug=True)
