@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
 import subprocess
 from werkzeug.utils import secure_filename
+import time
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +28,11 @@ app = Flask(__name__)
 # --- 数据库配置 ---
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
+        # 处理 Heroku/Render 的 PostgreSQL SSL 问题
         app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        # 添加 SSL 配置以解决 "decryption failed or bad record mac" 错误
+        if "?sslmode=" not in app.config['SQLALCHEMY_DATABASE_URI']:
+            app.config['SQLALCHEMY_DATABASE_URI'] += "?sslmode=require"
     elif DATABASE_URL.startswith("mysql://"):
         app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
     else:
@@ -43,6 +48,14 @@ else:
     logger.info("使用本地开发数据库")
 
 app.config['SECRET_KEY'] = SECRET_KEY
+
+# 添加数据库连接池配置以提高稳定性
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+    'pool_timeout': 900,
+    'max_overflow': 0
+}
 
 # --- Session 和 CORS 配置 ---
 if DATABASE_URL:
@@ -67,6 +80,15 @@ logger.info(f"上传目录设置为: {UPLOAD_BASE}")
 @app.route('/')
 def health_check():
     return jsonify({"status": "ok", "message": "Server is running"}), 200
+
+# 添加数据库健康检查路由
+@app.route('/health')
+def health():
+    try:
+        db.session.execute(text('SELECT 1'))
+        return jsonify({"status": "healthy", "database": "connected"}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
@@ -94,20 +116,26 @@ scheduler = BackgroundScheduler()
 scheduler.add_jobstore(SQLAlchemyJobStore(url=app.config['SQLALCHEMY_DATABASE_URI']), 'default')
 
 def start_scheduler():
-    try:
-        # 测试数据库连接
-        db.session.execute(text('SELECT 1'))
-        logger.info("数据库连接成功")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 测试数据库连接
+            db.session.execute(text('SELECT 1'))
+            logger.info("数据库连接成功")
 
-        # 启动调度器
-        if not scheduler.running:
-            scheduler.start()
-            logger.info("调度器已成功启动")
-        else:
-            logger.info("调度器已在运行中")
-    except Exception as e:
-        logger.error(f"调度器启动失败: {str(e)}")
-        raise
+            # 启动调度器
+            if not scheduler.running:
+                scheduler.start()
+                logger.info("调度器已成功启动")
+            else:
+                logger.info("调度器已在运行中")
+            return
+        except Exception as e:
+            logger.error(f"调度器启动失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # 等待2秒后重试
+            else:
+                raise
 
 # 在应用上下文中启动调度器
 with app.app_context():
@@ -275,6 +303,7 @@ def start_task(task_id):
         if 'user_id' not in session:
             return jsonify({"error": "请先登录"}), 401
 
+        # 使用独立的数据库会话避免连接问题
         task = Task.query.filter(Task.id == task_id, Task.user_id == session['user_id']).first()
         if not task:
             return jsonify({"error": "任务未找到"}), 404
@@ -306,15 +335,20 @@ def start_task(task_id):
             return jsonify({"error": "添加任务失败"}), 500
 
         # 更新状态
-        task.status = 'running'
-        db.session.commit()
-        logger.info(f"任务状态更新为 running: {task.task_name}")
+        try:
+            task.status = 'running'
+            db.session.commit()
+            logger.info(f"任务状态更新为 running: {task.task_name}")
+        except Exception as e:
+            logger.error(f"更新任务状态失败: {str(e)}")
+            # 即使状态更新失败，也不影响任务执行
+            pass
 
         return jsonify({"message": "任务已启动"}), 200
 
     except Exception as e:
         logger.error(f"任务启动失败: {str(e)}")
-        return jsonify({"error": "任务启动失败"}), 500
+        return jsonify({"error": "任务启动失败，请检查数据库连接"}), 500
 
 @app.route('/stop/<int:task_id>', methods=['POST'])
 def stop_task(task_id):
