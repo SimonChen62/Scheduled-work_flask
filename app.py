@@ -13,6 +13,7 @@ from datetime import datetime
 import subprocess
 from werkzeug.utils import secure_filename
 import time
+import signal
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -303,7 +304,6 @@ def start_task(task_id):
         if 'user_id' not in session:
             return jsonify({"error": "请先登录"}), 401
 
-        # 使用独立的数据库会话避免连接问题
         task = Task.query.filter(Task.id == task_id, Task.user_id == session['user_id']).first()
         if not task:
             return jsonify({"error": "任务未找到"}), 404
@@ -330,21 +330,17 @@ def start_task(task_id):
                 replace_existing=True
             )
             logger.info(f"任务已添加到调度器: {task.task_name}")
-        except Exception as e:
-            logger.error(f"添加任务到调度器失败: {str(e)}")
-            return jsonify({"error": "添加任务失败"}), 500
-
-        # 更新状态
-        try:
+            
+            # 更新状态
             task.status = 'running'
             db.session.commit()
             logger.info(f"任务状态更新为 running: {task.task_name}")
+            
+            return jsonify({"message": "任务已启动", "status": "running"}), 200
+            
         except Exception as e:
-            logger.error(f"更新任务状态失败: {str(e)}")
-            # 即使状态更新失败，也不影响任务执行
-            pass
-
-        return jsonify({"message": "任务已启动"}), 200
+            logger.error(f"添加任务到调度器失败: {str(e)}")
+            return jsonify({"error": "添加任务失败"}), 500
 
     except Exception as e:
         logger.error(f"任务启动失败: {str(e)}")
