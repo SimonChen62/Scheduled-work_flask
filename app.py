@@ -28,14 +28,18 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'a-very-secret-key-for-dev')
 app = Flask(__name__)
 CORS(app, origins=FRONTEND_URL, supports_credentials=True)
 
-# --- 部署修改 ---
+# --- 部署修改 (适配Postgres) ---
 # 4. 配置数据库和密钥
 if DATABASE_URL:
     # 生产环境 (Render): 使用 DATABASE_URL
-    # Render 提供的 mysql url 可能是 mysql://...，需要替换为 mysql+pymysql://
-    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
+    # Render 提供的 postgres url 可能是 postgres://...，需要替换为 postgresql://
+    if DATABASE_URL.startswith("postgres://"):
+        app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    else:
+        # 保留对MySQL的支持，以防将来切换
+        app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
 else:
-    # 本地开发环境: 使用旧的配置
+    # 本地开发环境: 仍然使用您的MySQL配置
     HOSTNAME="localhost"
     PORT="3306"
     USERNAME="root"
@@ -227,4 +231,3 @@ def get_task():
         "created_at": task.created_at.strftime("%Y-%m-%d %H:%M:%S")
     } for task in tasks]
     return jsonify({"tasks": task_list}), 200
-
