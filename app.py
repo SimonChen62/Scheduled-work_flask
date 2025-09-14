@@ -24,7 +24,6 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
 
 app = Flask(__name__)
-CORS(app, origins=FRONTEND_URL, supports_credentials=True)
 
 # --- 数据库配置 ---
 if DATABASE_URL:
@@ -47,8 +46,20 @@ else:
     logger.info("使用本地开发数据库")
 
 app.config['SECRET_KEY'] = SECRET_KEY
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_HTTPONLY'] = True
+
+# --- Session和CORS配置 ---
+# 根据是否为生产环境设置不同的session配置
+if DATABASE_URL:  # 生产环境
+    app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+    app.config['SESSION_COOKIE_SECURE'] = True
+    CORS(app, origins=FRONTEND_URL, supports_credentials=True, 
+         allow_headers=["Content-Type", "Authorization"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+else:  # 本地开发环境
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    app.config['SESSION_COOKIE_SECURE'] = False
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    CORS(app, origins=FRONTEND_URL, supports_credentials=True)
 
 # --- 文件上传配置 ---
 # 使用相对路径确保跨平台兼容
@@ -339,6 +350,18 @@ def get_task():
     except Exception as e:
         logger.error(f"获取任务列表失败: {str(e)}")
         return jsonify({"error": "获取任务列表失败"}), 500
+
+# 添加会话检查端点
+@app.route('/api/check-auth', methods=['GET'])
+def check_auth():
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        if user:
+            return jsonify({
+                'isAuthenticated': True,
+                'user': {'id': user.id, 'username': user.username}
+            }), 200
+    return jsonify({'isAuthenticated': False}), 401
 
 if __name__ == '__main__':
     # 本地开发时创建数据库表
